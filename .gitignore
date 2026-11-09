@@ -27,3 +27,7 @@ android/build
 # Default developer dump file
 
 DUMP.txt
+
+# Release tarballs produced by dev-scripts/make-pear-release.sh
+
+PearLegacyEngine-*.tar.gz
