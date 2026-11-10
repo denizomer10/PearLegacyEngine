@@ -25,7 +25,7 @@ use std::collections::HashMap;
 
 pub(crate) mod arc;
 pub(crate) mod classes;
-mod messages;
+pub(crate) mod messages;
 mod methods;
 mod objects;
 mod properties;

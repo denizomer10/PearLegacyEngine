@@ -1575,6 +1575,7 @@ impl Environment {
             }
         }
         if self.gdb_server.is_none() {
+            crate::objc::messages::log_recent_messages(self);
             panic!("Error during CPU execution: {error:?}");
         }
 

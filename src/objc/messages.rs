@@ -177,6 +177,30 @@ fn maybe_initialize_class(env: &mut Environment, receiver: id) {
 /// Similarly, the return value of `objc_msgSend` is whatever value is returned
 /// by the method implementation. We are relying on CallFromGuest not
 /// overwriting it.
+/// Logs the most recent ObjC message dispatches, for diagnosing a panic.
+pub(crate) fn log_recent_messages(env: &mut Environment) {
+    MSG_RING.with(|ring| {
+        let entries: Vec<(Class, SEL)> = ring.borrow().iter().copied().collect();
+        log!(
+            "Last {} ObjC messages before panic (oldest first):",
+            entries.len()
+        );
+        for (cls, sel) in entries {
+            let name: String = env
+                .objc
+                .get_host_object(cls)
+                .and_then(|host_object| {
+                    host_object
+                        .as_any()
+                        .downcast_ref::<super::ClassHostObject>()
+                        .map(|class| class.name.clone())
+                })
+                .unwrap_or_default();
+            log!("  [{}] {}", name, sel.as_str(&env.mem));
+        }
+    });
+}
+
 #[allow(non_snake_case)]
 fn objc_msgSend_inner(
     env: &mut Environment,
@@ -201,7 +225,19 @@ fn objc_msgSend_inner(
     }
 
     let orig_class = super2.unwrap_or_else(|| ObjC::read_isa(receiver, &env.mem));
-    assert!(orig_class != nil);
+    if orig_class == nil {
+        log!(
+            "Message \"{}\" sent to object {:?}, which has a nil isa (its class pointer was never set or was overwritten)",
+            selector.as_str(&env.mem),
+            receiver,
+        );
+        log_recent_messages(env);
+        panic!(
+            "Message \"{}\" sent to object {:?} with a nil isa!",
+            selector.as_str(&env.mem),
+            receiver,
+        );
+    }
     MSG_RING.with(|ring| {
         let mut ring = ring.borrow_mut();
         if ring.len() == MSG_RING_CAP {
@@ -220,26 +256,7 @@ fn objc_msgSend_inner(
         if class == nil {
             assert!(class != orig_class);
 
-            MSG_RING.with(|ring| {
-                let entries: Vec<(Class, SEL)> = ring.borrow().iter().copied().collect();
-                log!(
-                    "Last {} ObjC messages before panic (oldest first):",
-                    entries.len()
-                );
-                for (cls, sel) in entries {
-                    let name: String = env
-                        .objc
-                        .get_host_object(cls)
-                        .and_then(|host_object| {
-                            host_object
-                                .as_any()
-                                .downcast_ref::<super::ClassHostObject>()
-                                .map(|class| class.name.clone())
-                        })
-                        .unwrap_or_default();
-                    log!("  [{}] {}", name, sel.as_str(&env.mem));
-                }
-            });
+            log_recent_messages(env);
 
             let receiver_class = ObjC::read_isa(receiver, &env.mem);
             let receiver_name: String = env

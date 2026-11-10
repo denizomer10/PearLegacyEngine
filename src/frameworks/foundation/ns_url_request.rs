@@ -83,17 +83,19 @@ pub const CLASSES: ClassExports = objc_classes! {
         timeout_interval,
     );
 
-    // Preserving old behaviour
+    // A request is an immutable value object: it must never be nil, even when
+    // network access is disabled. The failure has to be reported by the
+    // connection instead (-[NSURLConnection initWithRequest:delegate:] in
+    // ns_url_connection.rs), because guest apps store the request and then
+    // dereference it.
     if !env.options.network_access {
         log_dbg!(
-            "Network access is disabled, [(NSURLRequest *){:?} initWithURL:{} cachePolicy:{} timeoutInterval:{}] -> nil",
+            "Network access is disabled, [(NSURLRequest *){:?} initWithURL:{} cachePolicy:{} timeoutInterval:{}] will fail when the request is performed",
             this,
             to_rust_string(env, url_desc),
             cache_policy,
             timeout_interval,
         );
-        release(env, this);
-        return nil;
     }
 
     let url_copy = msg![env; url copy];
@@ -115,15 +117,13 @@ pub const CLASSES: ClassExports = objc_classes! {
         to_rust_string(env, url_desc)
     );
 
-    // Preserving old behaviour
+    // See the other initializer for why this must not return nil.
     if !env.options.network_access {
         log_dbg!(
-            "Network access is disabled, [(NSURLRequest *){:?} initWithURL:{}] -> nil",
+            "Network access is disabled, [(NSURLRequest *){:?} initWithURL:{}] will fail when the request is performed",
             this,
             to_rust_string(env, url_desc)
         );
-        release(env, this);
-        return nil;
     }
 
     let url_copy = msg![env; url copy];
