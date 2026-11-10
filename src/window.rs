@@ -382,6 +382,88 @@ pub struct Window {
     pub(super) on_main_stack: bool,
 }
 
+
+static SWAP_DIAG_ENABLED: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| std::env::var_os("PEAR_PRESENT_DIAG").is_some());
+
+/// Human-readable form of SDL's window state, for "the app says it's drawing
+/// but the screen is black" reports: a hidden, minimised or occluded window is
+/// a far more likely explanation than a rendering bug.
+fn describe_window_flags(window: &sdl2::video::Window) -> String {
+    use sdl2_sys::SDL_WindowFlags as F;
+    let flags = window.window_flags();
+    let mut names = Vec::new();
+    for (flag, name) in [
+        (F::SDL_WINDOW_SHOWN, "shown"),
+        (F::SDL_WINDOW_HIDDEN, "hidden"),
+        (F::SDL_WINDOW_MINIMIZED, "minimized"),
+        (F::SDL_WINDOW_MAXIMIZED, "maximized"),
+        (F::SDL_WINDOW_INPUT_FOCUS, "input-focus"),
+        (F::SDL_WINDOW_MOUSE_FOCUS, "mouse-focus"),
+        (F::SDL_WINDOW_FULLSCREEN, "fullscreen"),
+        (F::SDL_WINDOW_METAL, "metal"),
+    ] {
+        if flags & flag as u32 != 0 {
+            names.push(name);
+        }
+    }
+    if names.is_empty() {
+        names.push("none");
+    }
+    format!("flags={:#x} ({})", flags, names.join("|"))
+}
+
+/// Logs an `eglSwapBuffers` that failed. A rejected swap means the frame the
+/// guest just drew never reaches the screen, so it is always logged, but only
+/// for the first few occurrences and then periodically, since the guest keeps
+/// presenting at ~30 Hz.
+fn report_failed_swap(window: &Window, egl_error: i32) {
+    static FAILURES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let count = FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if count >= 3 && !count.is_multiple_of(300) {
+        return;
+    }
+    let (w, h) = window.window.size();
+    log!(
+        "swap_window: eglSwapBuffers FAILED (EGL error {:#x}), {} failed swaps so far, window {}x{}, {}",
+        egl_error,
+        count + 1,
+        w,
+        h,
+        describe_window_flags(&window.window)
+    );
+}
+
+/// Periodic `PEAR_PRESENT_DIAG` report of everything that decides whether a
+/// presented frame can actually appear on screen.
+fn report_swap_diag(window: &Window) {
+    static SWAPS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let count = SWAPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if !count.is_multiple_of(150) {
+        return;
+    }
+    let (w, h) = window.window.size();
+    let (mut dw, mut dh) = (0, 0);
+    unsafe { sdl2_sys::SDL_Metal_GetDrawableSize(window.window.raw(), &mut dw, &mut dh) };
+    let egl = crate::egl::global();
+    let surface_w = unsafe { egl.query_surface(window.egl_display, window.egl_surface, crate::egl::EGL_WIDTH) };
+    let surface_h = unsafe { egl.query_surface(window.egl_display, window.egl_surface, crate::egl::EGL_HEIGHT) };
+    let (_, _, vw, vh) = window.viewport();
+    log!(
+        "Present diag: swap #{}, window {}x{}, drawable {}x{}, egl surface {}x{}, viewport {}x{}, {}",
+        count,
+        w,
+        h,
+        dw,
+        dh,
+        surface_w,
+        surface_h,
+        vw,
+        vh,
+        describe_window_flags(&window.window)
+    );
+}
+
 impl Window {
     /// Returns [true] if touchHLE is running on a device where we should always
     /// display fullscreen, but SDL2 will let us control the orientation, i.e.
@@ -1166,19 +1248,16 @@ impl Window {
         use std::sync::{Mutex, OnceLock};
 
         struct ScriptState {
+            path: std::path::PathBuf,
+            modified: Option<std::time::SystemTime>,
             start: Instant,
             events: Vec<(u64, f32, f32, bool)>,
             next: usize,
         }
 
-        static STATE: OnceLock<Mutex<Option<ScriptState>>> = OnceLock::new();
-        let state = STATE.get_or_init(|| {
-            let Ok(path) = std::env::var("PEAR_TOUCH_SCRIPT") else {
-                return Mutex::new(None);
-            };
-            let Ok(text) = std::fs::read_to_string(path) else {
-                return Mutex::new(None);
-            };
+        /// Parses `<time_ms> <x> <y> <down|up>` lines. Blank lines and lines
+        /// starting with `#` are ignored.
+        fn parse_script(text: &str) -> Vec<(u64, f32, f32, bool)> {
             let mut events = Vec::new();
             for line in text.lines() {
                 let line = line.trim();
@@ -1201,9 +1280,24 @@ impl Window {
                     kind == "down",
                 ));
             }
+            events
+        }
+
+        static STATE: OnceLock<Mutex<Option<ScriptState>>> = OnceLock::new();
+        let state = STATE.get_or_init(|| {
+            let Ok(path) = std::env::var("PEAR_TOUCH_SCRIPT") else {
+                return Mutex::new(None);
+            };
+            let path = std::path::PathBuf::from(path);
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                return Mutex::new(None);
+            };
+            let modified = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
             Mutex::new(Some(ScriptState {
+                path,
+                modified,
                 start: Instant::now(),
-                events,
+                events: parse_script(&text),
                 next: 0,
             }))
         });
@@ -1212,6 +1306,24 @@ impl Window {
         let Some(script) = guard.as_mut() else {
             return;
         };
+        // The script can be edited while the emulated app runs: appended taps
+        // are picked up on the next poll, which makes it possible to drive a
+        // UI that has to be observed between steps.
+        let modified = std::fs::metadata(&script.path)
+            .and_then(|m| m.modified())
+            .ok();
+        if modified != script.modified {
+            script.modified = modified;
+            if let Ok(text) = std::fs::read_to_string(&script.path) {
+                script.events = parse_script(&text);
+                let elapsed_ms = script.start.elapsed().as_millis() as u64;
+                script.next = script
+                    .events
+                    .iter()
+                    .position(|event| event.0 > elapsed_ms)
+                    .unwrap_or(script.events.len());
+            }
+        }
         while let Some(&(time_ms, x, y, down)) = script.events.get(script.next) {
             if script.start.elapsed() < Duration::from_millis(time_ms) {
                 break;
@@ -1624,7 +1736,14 @@ impl Window {
     /// presented.
     pub fn swap_window(&self) {
         unsafe {
-            crate::egl::global().swap_buffers(self.egl_display, self.egl_surface);
+            let egl = crate::egl::global();
+            let ok = egl.swap_buffers(self.egl_display, self.egl_surface);
+            if !ok {
+                report_failed_swap(self, egl.last_error());
+            }
+            if *SWAP_DIAG_ENABLED {
+                report_swap_diag(self);
+            }
         }
     }
 

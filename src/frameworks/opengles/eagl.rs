@@ -620,6 +620,51 @@ fn record_present_time(secs: f64) {
     });
 }
 
+/// Dumps the just-drawn back buffer — i.e. exactly what the window is meant to
+/// show — to `<PEAR_PRESENT_DUMP_PREFIX><n>.raw` every n-th present, in the same
+/// format as `PEAR_DUMP_FRAME`. Unlike that one this has no frame limit, so it
+/// can capture the state long after launch. Enabled by
+/// `PEAR_PRESENT_DUMP_EVERY`.
+unsafe fn dump_presented_frame(gles: &mut dyn GLES, width: i32, height: i32, every: u32) {
+    static COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let n = COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if width <= 0 || height <= 0 || !n.is_multiple_of(every) {
+        return;
+    }
+    let mut pixels = vec![0u8; (width * height * 4) as usize];
+    gles.ReadPixels(
+        0,
+        0,
+        width,
+        height,
+        gles11::RGBA,
+        gles11::UNSIGNED_BYTE,
+        pixels.as_mut_ptr().cast(),
+    );
+    // GL rows are bottom-up; store top-down like PEAR_DUMP_FRAME does.
+    let row = (width * 4) as usize;
+    let mut flipped = vec![0u8; pixels.len()];
+    for y in 0..height as usize {
+        let src = (height as usize - 1 - y) * row;
+        flipped[y * row..(y + 1) * row].copy_from_slice(&pixels[src..src + row]);
+    }
+    let prefix = std::env::var("PEAR_PRESENT_DUMP_PREFIX")
+        .unwrap_or_else(|_| "/tmp/pear-present-".to_string());
+    let mut out = format!("{width} {height}\n").into_bytes();
+    out.extend_from_slice(&flipped);
+    let _ = std::fs::write(format!("{prefix}{n:05}.raw"), out);
+}
+
+fn present_dump_every() -> Option<u32> {
+    static EVERY: std::sync::LazyLock<Option<u32>> = std::sync::LazyLock::new(|| {
+        std::env::var("PEAR_PRESENT_DUMP_EVERY")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .filter(|n| *n > 0)
+    });
+    *EVERY
+}
+
 /// Reads back a centre crop of the just-drawn back buffer and reports how much
 /// of it is non-black, so that presentation can be verified without a human
 /// looking at the screen. Enabled by `PEAR_CONTENT_SELFTEST`.
@@ -870,6 +915,10 @@ unsafe fn present_renderbuffer(env: &mut Environment) {
 
         if content_self_test_enabled() {
             self_test_content(gles, viewport.2 as i32, viewport.3 as i32);
+        }
+
+        if let Some(every) = present_dump_every() {
+            dump_presented_frame(gles, viewport.2 as i32, viewport.3 as i32, every);
         }
     }
 

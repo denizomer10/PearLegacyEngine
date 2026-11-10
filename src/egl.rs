@@ -30,6 +30,7 @@ pub const EGL_NO_SURFACE: EGLSurface = std::ptr::null_mut();
 pub const EGL_FALSE: EGLBoolean = 0;
 
 pub const EGL_NONE: EGLint = 0x3038;
+pub const EGL_TRUE: EGLint = 1;
 pub const EGL_SURFACE_TYPE: EGLint = 0x3033;
 pub const EGL_WINDOW_BIT: EGLint = 0x0004;
 pub const EGL_RENDERABLE_TYPE: EGLint = 0x3040;
@@ -339,8 +340,15 @@ impl EglLib {
         Ok(())
     }
 
-    pub unsafe fn swap_buffers(&self, display: EGLDisplay, surface: EGLSurface) {
-        (self.eglSwapBuffers)(display, surface);
+    /// Presents the back buffer. Returns `false` if EGL rejected the swap (e.g.
+    /// the drawable could not be acquired). Callers should not ignore this.
+    pub unsafe fn swap_buffers(&self, display: EGLDisplay, surface: EGLSurface) -> bool {
+        (self.eglSwapBuffers)(display, surface) == EGL_TRUE as u32
+    }
+
+    /// Returns and clears the current EGL error for the calling thread.
+    pub unsafe fn last_error(&self) -> EGLint {
+        (self.eglGetError)()
     }
 
     pub fn current_context(&self) -> EGLContext {
