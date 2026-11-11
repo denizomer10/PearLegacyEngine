@@ -206,6 +206,14 @@ pub fn open_direct(env: &mut Environment, path: ConstPtr<u8>, flags: i32) -> Fil
         .open_with_options(GuestPath::new(&path_string), options)
     {
         Ok(file) => {
+            static TRACE_OPEN: std::sync::LazyLock<bool> =
+                std::sync::LazyLock::new(|| std::env::var_os("PEAR_TRACE_OPEN").is_some());
+            if *TRACE_OPEN {
+                log!("PEAR_OPEN: {:?} with {:#x}", path_string, flags);
+            }
+            if env.fs.is_dir(GuestPath::new(&path_string)) {
+                log!("Note: open() of directory {:?} with {:#x}", path_string, flags);
+            }
             let host_object = PosixFileHostObject {
                 file,
                 needs_flush,

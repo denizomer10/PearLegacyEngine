@@ -88,6 +88,10 @@ pub(super) struct UIViewHostObject {
     clears_context_before_drawing: bool,
     user_interaction_enabled: bool,
     multiple_touch_enabled: bool,
+    /// UIViewAutoresizing mask: how this view follows its superview's size.
+    autoresizing_mask: NSUInteger,
+    /// Whether subviews are resized when this view's bounds change.
+    autoresizes_subviews: bool,
 }
 impl HostObject for UIViewHostObject {}
 impl Default for UIViewHostObject {
@@ -103,6 +107,8 @@ impl Default for UIViewHostObject {
             clears_context_before_drawing: true,
             user_interaction_enabled: true,
             multiple_touch_enabled: false,
+            autoresizing_mask: 0,
+            autoresizes_subviews: true,
         }
     }
 }
@@ -144,6 +150,101 @@ fn init_common(env: &mut Environment, this: id) -> id {
     env.framework_state.uikit.ui_view.views.push(this);
 
     this
+}
+
+const UIViewAutoresizingFlexibleLeftMargin: NSUInteger = 1 << 0;
+const UIViewAutoresizingFlexibleWidth: NSUInteger = 1 << 1;
+const UIViewAutoresizingFlexibleRightMargin: NSUInteger = 1 << 2;
+const UIViewAutoresizingFlexibleTopMargin: NSUInteger = 1 << 3;
+const UIViewAutoresizingFlexibleHeight: NSUInteger = 1 << 4;
+const UIViewAutoresizingFlexibleBottomMargin: NSUInteger = 1 << 5;
+
+/// Distributes a change of the superview's length along one axis between the
+/// flexible parts of a subview (leading margin, size, trailing margin), in
+/// proportion to their current lengths, as UIKit does. Returns the new
+/// (origin, size).
+fn autoresize_axis(
+    origin: CGFloat,
+    size: CGFloat,
+    old_super: CGFloat,
+    new_super: CGFloat,
+    flexible: [bool; 3],
+) -> (CGFloat, CGFloat) {
+    let delta = new_super - old_super;
+    let parts = [origin, size, old_super - origin - size];
+    let count = flexible.iter().filter(|&&f| f).count();
+    if count == 0 || delta == 0.0 {
+        return (origin, size);
+    }
+    let total: CGFloat = parts
+        .iter()
+        .zip(flexible)
+        .filter(|(_, f)| *f)
+        .map(|(p, _)| p.max(0.0))
+        .sum();
+    let share = |i: usize| -> CGFloat {
+        if !flexible[i] {
+            0.0
+        } else if total > 0.0 {
+            delta * parts[i].max(0.0) / total
+        } else {
+            delta / count as CGFloat
+        }
+    };
+    (origin + share(0), (size + share(1)).max(0.0))
+}
+
+/// The UIKit `autoresizesSubviews` behaviour: after this view's bounds size
+/// changed from `old` to `new`, resize and move its subviews according to
+/// their `autoresizingMask`. Without this, views loaded from a nib keep their
+/// design-time size (e.g. 320x460 laid out under a status bar) when their
+/// superview is stretched to the full screen.
+fn autoresize_subviews(env: &mut Environment, this: id, old: CGSize, new: CGSize) {
+    if old == new || old.width <= 0.0 || old.height <= 0.0 {
+        return;
+    }
+    let host = env.objc.borrow::<UIViewHostObject>(this);
+    if !host.autoresizes_subviews {
+        return;
+    }
+    let subviews = host.subviews.clone();
+    for subview in subviews {
+        let mask = env.objc.borrow::<UIViewHostObject>(subview).autoresizing_mask;
+        if mask == 0 {
+            continue;
+        }
+        let frame: CGRect = msg![env; subview frame];
+        let (x, width) = autoresize_axis(
+            frame.origin.x,
+            frame.size.width,
+            old.width,
+            new.width,
+            [
+                mask & UIViewAutoresizingFlexibleLeftMargin != 0,
+                mask & UIViewAutoresizingFlexibleWidth != 0,
+                mask & UIViewAutoresizingFlexibleRightMargin != 0,
+            ],
+        );
+        let (y, height) = autoresize_axis(
+            frame.origin.y,
+            frame.size.height,
+            old.height,
+            new.height,
+            [
+                mask & UIViewAutoresizingFlexibleTopMargin != 0,
+                mask & UIViewAutoresizingFlexibleHeight != 0,
+                mask & UIViewAutoresizingFlexibleBottomMargin != 0,
+            ],
+        );
+        let new_frame = CGRect {
+            origin: CGPoint { x, y },
+            size: CGSize { width, height },
+        };
+        if new_frame != frame {
+            log_dbg!("autoresize {:?}: {:?} -> {:?} (mask {:#x})", subview, frame, new_frame, mask);
+            () = msg![env; subview setFrame:new_frame];
+        }
+    }
 }
 
 pub const CLASSES: ClassExports = objc_classes! {
@@ -367,6 +468,20 @@ pub const CLASSES: ClassExports = objc_classes! {
 
     let key_ns_string = get_static_str(env, "UIMultipleTouchEnabled");
     let multi_touch_enabled: bool = msg![env; coder decodeBoolForKey:key_ns_string];
+
+    let key_ns_string = get_static_str(env, "UIAutoresizingMask");
+    let autoresizing_mask: NSInteger = msg![env; coder decodeIntegerForKey:key_ns_string];
+    let key_ns_string = get_static_str(env, "UIAutoresizeSubviews");
+    let autoresizes_subviews: bool = if msg![env; coder containsValueForKey:key_ns_string] {
+        msg![env; coder decodeBoolForKey:key_ns_string]
+    } else {
+        true
+    };
+    {
+        let host = env.objc.borrow_mut::<UIViewHostObject>(this);
+        host.autoresizing_mask = autoresizing_mask as NSUInteger;
+        host.autoresizes_subviews = autoresizes_subviews;
+    }
 
     let key_ns_string = get_static_str(env, "UISubviews");
     let subviews: id = msg![env; coder decodeObjectForKey:key_ns_string];
@@ -626,6 +741,8 @@ pub const CLASSES: ClassExports = objc_classes! {
         clears_context_before_drawing: _,
         user_interaction_enabled: _,
         multiple_touch_enabled: _,
+        autoresizing_mask: _,
+        autoresizes_subviews: _,
     } = std::mem::take(env.objc.borrow_mut(this));
 
     release(env, layer);
@@ -725,7 +842,10 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 - (())setBounds:(CGRect)bounds {
     let layer = env.objc.borrow::<UIViewHostObject>(this).layer;
-    msg![env; layer setBounds:bounds]
+    let old: CGRect = msg![env; layer bounds];
+    () = msg![env; layer setBounds:bounds];
+    let new: CGRect = msg![env; layer bounds];
+    autoresize_subviews(env, this, old.size, new.size);
 }
 - (CGPoint)center {
     // FIXME: what happens if [layer anchorPoint] isn't (0.5, 0.5)?
@@ -742,7 +862,10 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 - (())setFrame:(CGRect)frame {
     let layer = env.objc.borrow::<UIViewHostObject>(this).layer;
-    msg![env; layer setFrame:frame]
+    let old: CGRect = msg![env; layer bounds];
+    () = msg![env; layer setFrame:frame];
+    let new: CGRect = msg![env; layer bounds];
+    autoresize_subviews(env, this, old.size, new.size);
 }
 - (CGAffineTransform)transform {
     let layer = env.objc.borrow::<UIViewHostObject>(this).layer;
@@ -893,11 +1016,17 @@ pub const CLASSES: ClassExports = objc_classes! {
     msg![env; this_layer convertRect:rect toLayer:other_layer]
 }
 
+- (NSUInteger)autoresizingMask {
+    env.objc.borrow::<UIViewHostObject>(this).autoresizing_mask
+}
 - (())setAutoresizingMask:(NSUInteger)mask {
-    todo_objc_setter!(this, mask);
+    env.objc.borrow_mut::<UIViewHostObject>(this).autoresizing_mask = mask;
+}
+- (bool)autoresizesSubviews {
+    env.objc.borrow::<UIViewHostObject>(this).autoresizes_subviews
 }
 - (())setAutoresizesSubviews:(bool)enabled {
-    todo_objc_setter!(this, enabled);
+    env.objc.borrow_mut::<UIViewHostObject>(this).autoresizes_subviews = enabled;
 }
 
 - (CGSize)sizeThatFits:(CGSize)size {
@@ -1009,3 +1138,30 @@ pub const CLASSES: ClassExports = objc_classes! {
 @end
 
 };
+
+#[cfg(test)]
+mod autoresize_tests {
+    use super::autoresize_axis;
+
+    #[test]
+    fn flexible_height_fills_taller_superview() {
+        // A 460-pt nib view in a superview stretched from 460 to 480.
+        assert_eq!(autoresize_axis(0.0, 460.0, 460.0, 480.0, [false, true, false]), (0.0, 480.0));
+    }
+
+    #[test]
+    fn fixed_view_does_not_move() {
+        assert_eq!(autoresize_axis(10.0, 100.0, 460.0, 480.0, [false, false, false]), (10.0, 100.0));
+    }
+
+    #[test]
+    fn flexible_top_margin_keeps_view_pinned_to_bottom() {
+        assert_eq!(autoresize_axis(400.0, 60.0, 460.0, 480.0, [true, false, false]), (420.0, 60.0));
+    }
+
+    #[test]
+    fn delta_is_shared_in_proportion() {
+        // Margins 100 and 200 share 30 points: 10 and 20.
+        assert_eq!(autoresize_axis(100.0, 50.0, 350.0, 380.0, [true, false, true]), (110.0, 50.0));
+    }
+}
