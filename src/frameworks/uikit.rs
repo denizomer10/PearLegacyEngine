@@ -115,6 +115,17 @@ pub fn handle_events(env: &mut Environment) -> Option<Instant> {
     while let Some(event) = env.window_mut().pop_event() {
         match event {
             Event::Quit => {
+                // `PEAR_IGNORE_QUIT=1` keeps the app alive when the host window
+                // is closed, so long unattended repro/verification runs (e.g.
+                // driving a song to its end with PEAR_TOUCH_SCRIPT) aren't
+                // killed by an accidental window close.
+                static IGNORE_QUIT: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+                    std::env::var_os("PEAR_IGNORE_QUIT").is_some()
+                });
+                if *IGNORE_QUIT {
+                    log_dbg!("Ignoring quit event (PEAR_IGNORE_QUIT).");
+                    continue;
+                }
                 echo!("User requested quit, exiting.");
                 ui_application::exit(env);
             }

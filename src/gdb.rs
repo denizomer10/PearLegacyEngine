@@ -34,6 +34,10 @@ pub struct GdbServer {
     thread_for_run: isize,
     thread_for_other: isize,
     first_halt: bool,
+    /// Set once the debugger detached (`D`) or its connection closed. The
+    /// guest then keeps running instead of waiting for a debugger that will
+    /// never come back; the environment drops the server.
+    detached: bool,
 }
 
 impl GdbServer {
@@ -59,6 +63,7 @@ impl GdbServer {
             thread_for_run: 0,
             thread_for_other: 0,
             first_halt: true,
+            detached: false,
         }
     }
 
@@ -66,14 +71,19 @@ impl GdbServer {
         let buffer = match self.reader.fill_buf() {
             Ok(buffer) => buffer,
             Err(e) => match e.kind() {
-                ErrorKind::BrokenPipe | ErrorKind::ConnectionReset => {
-                    panic!("Lost connection to debugger: {}", e.kind());
+                ErrorKind::BrokenPipe | ErrorKind::ConnectionReset | ErrorKind::ConnectionAborted => {
+                    echo!("Lost connection to debugger ({}); resuming the app.", e.kind());
+                    self.detached = true;
+                    return None;
                 }
                 _ => return None,
             },
         };
 
         if buffer.is_empty() {
+            // EOF: the debugger closed the connection.
+            echo!("Debugger disconnected; resuming the app.");
+            self.detached = true;
             return None;
         }
 
@@ -125,9 +135,17 @@ impl GdbServer {
         Some(body)
     }
 
+    /// Whether the debugger has gone away; see [GdbServer::detached].
+    pub fn is_detached(&self) -> bool {
+        self.detached
+    }
+
     fn send_packet(&mut self, body: &str) {
         let checksum = body.bytes().fold(0u8, |a, b| a.wrapping_add(b));
-        write!(self.reader.get_mut(), "${body}#{checksum:02x}").unwrap();
+        if write!(self.reader.get_mut(), "${body}#{checksum:02x}").is_err() {
+            self.detached = true;
+            return;
+        }
         log_dbg!("Sent packet: {:?}", body);
     }
 
@@ -186,6 +204,10 @@ impl GdbServer {
         }
 
         'packet_loop: loop {
+            if self.detached {
+                resume_all(env);
+                break;
+            }
             let Some(p) = self.read_packet() else {
                 continue;
             };
@@ -334,6 +356,14 @@ impl GdbServer {
                         }
                     }
                 }
+                // Detach: leave every thread running.
+                b'D' => {
+                    self.send_packet("OK");
+                    echo!("Debugger detached; resuming the app.");
+                    self.detached = true;
+                    resume_all(env);
+                    break;
+                }
                 // Continue or "Continue with signal".
                 // Presumably "with" means "ignoring"?
                 b'c' | b'C' => {
@@ -461,7 +491,14 @@ impl GdbServer {
                 // Specifies thread commands should run on.
                 b'H' => {
                     let command = p.as_bytes()[1];
-                    let tid: isize = p.split_at(2).1.parse().unwrap();
+                    // Thread ids are hexadecimal in the GDB protocol (stop
+                    // replies are formatted with `{:x}`); `-1` means all threads.
+                    let arg = p.split_at(2).1;
+                    let tid: isize = if arg == "-1" {
+                        -1
+                    } else {
+                        isize::from_str_radix(arg, 16).unwrap_or(0)
+                    };
                     if command == b'c' {
                         self.thread_for_run = tid;
                     } else if command == b'g' {
@@ -559,6 +596,15 @@ impl GdbServer {
                     self.send_packet("");
                 }
             }
+        }
+    }
+}
+
+/// Marks every live guest thread runnable (used when the debugger leaves).
+fn resume_all(env: &mut Environment) {
+    for thread in env.threads.iter_mut() {
+        if thread.is_alive() {
+            thread.state = ThreadState::Running;
         }
     }
 }

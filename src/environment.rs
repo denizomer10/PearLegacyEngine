@@ -295,6 +295,22 @@ fn generate_binary_load_order(graph: &[BinaryDependencyNode]) -> Result<Vec<usiz
 static ENVIRONMENT_INSTANCE_EXISTS: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+// Opt-in run-loop diagnostics. The environment is read once: these checks sit
+// on the scheduler's hot path and run on every guest thread switch.
+static PEAR_PC_HIST: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| std::env::var_os("PEAR_PC_HIST").is_some());
+static PEAR_STACK_DUMP_AFTER: std::sync::LazyLock<Option<u64>> = std::sync::LazyLock::new(|| {
+    std::env::var("PEAR_STACK_DUMP_AFTER").ok().and_then(|v| v.parse::<u64>().ok())
+});
+static PEAR_BREAK_AFTER: std::sync::LazyLock<Option<String>> =
+    std::sync::LazyLock::new(|| std::env::var("PEAR_BREAK_AFTER").ok());
+static PEAR_TRACE_MEM: std::sync::LazyLock<Option<String>> =
+    std::sync::LazyLock::new(|| std::env::var("PEAR_TRACE_MEM").ok());
+static PEAR_TRACE_PC: std::sync::LazyLock<Option<String>> =
+    std::sync::LazyLock::new(|| std::env::var("PEAR_TRACE_PC").ok());
+static PEAR_BREAK_WHEN_MEM: std::sync::LazyLock<Option<String>> =
+    std::sync::LazyLock::new(|| std::env::var("PEAR_BREAK_WHEN_MEM").ok());
+
 impl Environment {
     /// Loads the binary and sets up the emulator.
     pub fn new(
@@ -1337,7 +1353,9 @@ impl Environment {
         let panic_cell = self.panic_cell.clone();
         if let Some(mut gdb_server) = self.gdb_server.take() {
             gdb_server.wait_for_debugger(None, &mut self);
-            self.gdb_server = Some(gdb_server);
+            if !gdb_server.is_detached() {
+                self.gdb_server = Some(gdb_server);
+            }
         }
         loop {
             if self.threads[self.current_thread].state == ThreadState::Stepping {
@@ -1431,6 +1449,157 @@ impl Environment {
                 if let Some(ref mut window) = self.window {
                     window.poll_for_events(&self.options);
                 }
+                // Diagnostic: PEAR_PC_HIST=1 samples the current thread PC each
+                // loop iteration into a histogram, printed every 5s (top 12).
+                if *PEAR_PC_HIST {
+                    static HIST: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<u32, u64>>> =
+                        std::sync::OnceLock::new();
+                    static LAST_PRINT: std::sync::OnceLock<std::sync::Mutex<std::time::Instant>> =
+                        std::sync::OnceLock::new();
+                    let hist = HIST.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+                    let pc = self.cpu.regs()[cpu::Cpu::PC] & !1;
+                    {
+                        let mut h = hist.lock().unwrap();
+                        *h.entry(pc).or_insert(0) += 1;
+                    }
+                    let lp = LAST_PRINT.get_or_init(|| std::sync::Mutex::new(std::time::Instant::now()));
+                    let mut lp = lp.lock().unwrap();
+                    if lp.elapsed() >= Duration::from_secs(5) {
+                        *lp = std::time::Instant::now();
+                        let mut h = hist.lock().unwrap();
+                        let mut v: Vec<(u32, u64)> = h.drain().map(|(k, val)| (k, val)).collect();
+                        v.sort_by_key(|(_, val)| std::cmp::Reverse(*val));
+                        let t = self.startup_time.elapsed().as_secs_f64();
+                        echo_no_panic!("=== PEAR_PC_HIST @ {:.1}s top12 ===", t);
+                        for (pc, n) in v.iter().take(12) {
+                            echo_no_panic!("    pc=0x{:08x} x{}", pc, n);
+                        }
+                    }
+                }
+                // One-shot diagnostic: PEAR_STACK_DUMP_AFTER=<seconds> dumps all
+                // guest thread stacks once that much time has elapsed.
+                if let Some(secs) = *PEAR_STACK_DUMP_AFTER {
+                    static DUMPED: std::sync::atomic::AtomicBool =
+                        std::sync::atomic::AtomicBool::new(false);
+                    if !DUMPED.load(std::sync::atomic::Ordering::Relaxed)
+                        && self.startup_time.elapsed() >= Duration::from_secs(secs)
+                    {
+                        DUMPED.store(true, std::sync::atomic::Ordering::Relaxed);
+                        echo_no_panic!("=== PEAR_STACK_DUMP_AFTER: all guest thread stacks ===");
+                        self.stack_trace_all();
+                        echo_no_panic!("=== end of stack dump ===");
+                    }
+                }
+                // One-shot diagnostic: PEAR_BREAK_AFTER=<s1,s2,...> pauses the
+                // current guest thread into the gdb server at each listed time.
+                if let Some(times) = PEAR_BREAK_AFTER.as_deref() {
+                    static BREAKS: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
+                    let breaks = BREAKS.get_or_init(|| {
+                        times.split(',').filter_map(|v| v.trim().parse::<u64>().ok()).collect()
+                    });
+                    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+                    let elapsed = self.startup_time.elapsed().as_secs();
+                    let idx = NEXT.load(std::sync::atomic::Ordering::Relaxed);
+                    if idx < breaks.len() && elapsed >= breaks[idx] {
+                        NEXT.store(idx + 1, std::sync::atomic::Ordering::Relaxed);
+                        echo_no_panic!("=== PEAR_BREAK_AFTER: entering debugger at {}s ===", elapsed);
+                        self.threads[self.current_thread].blocked_by =
+                            ThreadBlock::WaitingForDebugger(None);
+                    }
+                }
+                // Diagnostic: PEAR_TRACE_MEM=<hexaddr>:<label> logs every change
+                // of the u32 at the guest address; PEAR_BREAK_WHEN_MEM=<hexaddr>:<hexvalue>
+                // pauses into the gdb server once when the value matches.
+                if let Some(spec) = PEAR_TRACE_MEM.as_deref() {
+                    static LAST: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<u32, u32>>> =
+                        std::sync::OnceLock::new();
+                    let last = LAST.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+                    for pair in spec.split(',') {
+                        if let Some((addr_s, label)) = pair.trim().split_once(':') {
+                            // "base+off" traces the u32 at *(u32*)base + off (one deref)
+                            let (base, off) = match addr_s.trim().split_once('+') {
+                                Some((b, o)) => (
+                                    u32::from_str_radix(b.trim(), 16).ok(),
+                                    u32::from_str_radix(o.trim(), 16).unwrap_or(0),
+                                ),
+                                None => (u32::from_str_radix(addr_s.trim(), 16).ok(), 0),
+                            };
+                            if let Some(base) = base {
+                                let addr = if off != 0 {
+                                    let p = self.mem.read::<u32, false>(mem::Ptr::<u32, false>::from_bits(base));
+                                    p.wrapping_add(off)
+                                } else {
+                                    base
+                                };
+                                // fallible read: skip if unmapped
+                                let v = self
+                                    .mem
+                                    .get_bytes_fallible(mem::ConstVoidPtr::from_bits(addr), 4)
+                                    .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+                                if let Some(v) = v {
+                                    let mut map = last.lock().unwrap();
+                                    let prev = map.insert(addr, v);
+                                    if prev != Some(v) {
+                                        echo_no_panic!(
+                                            "=== PEAR_TRACE_MEM {} 0x{:08x}: {:?} -> {} at {:.3}s ===",
+                                            label, addr, prev, v, self.startup_time.elapsed().as_secs_f64()
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                // Diagnostic: PEAR_TRACE_PC=<start>-<end>:<label> logs (up to 500
+                // times) whenever the current thread's PC enters the range.
+                if let Some(spec) = PEAR_TRACE_PC.as_deref() {
+                    static COUNT: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, usize>>> =
+                        std::sync::OnceLock::new();
+                    let counts = COUNT.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+                    for pair in spec.split(',') {
+                        if let Some((range_s, label)) = pair.trim().split_once(':') {
+                            if let Some((lo_s, hi_s)) = range_s.trim().split_once('-') {
+                                if let (Ok(lo), Ok(hi)) = (
+                                    u32::from_str_radix(lo_s.trim(), 16),
+                                    u32::from_str_radix(hi_s.trim(), 16),
+                                ) {
+                                    let pc = self.cpu.regs()[cpu::Cpu::PC];
+                                    if pc >= lo && pc < hi {
+                                        let mut map = counts.lock().unwrap();
+                                        let c = map.entry(label.to_string()).or_insert(0);
+                                        *c += 1;
+                                        if *c <= 500 {
+                                            echo_no_panic!(
+                                                "=== PEAR_TRACE_PC {} pc=0x{:08x} at {:.3}s ===",
+                                                label, pc, self.startup_time.elapsed().as_secs_f64()
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                if let Some(spec) = PEAR_BREAK_WHEN_MEM.as_deref() {
+                    static HIT: std::sync::atomic::AtomicBool =
+                        std::sync::atomic::AtomicBool::new(false);
+                    if let Some((addr_s, val_s)) = spec.split_once(':') {
+                        if let (Ok(addr), Ok(val)) = (
+                            u32::from_str_radix(addr_s.trim(), 16),
+                            u32::from_str_radix(val_s.trim(), 16),
+                        ) {
+                            let v = self.mem.read::<u32, false>(mem::Ptr::<u32, false>::from_bits(addr));
+                            if v == val && !HIT.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                                echo_no_panic!(
+                                    "=== PEAR_BREAK_WHEN_MEM: 0x{:08x} == 0x{:08x} at {:.3}s ===",
+                                    addr, val, self.startup_time.elapsed().as_secs_f64()
+                                );
+                                self.threads[self.current_thread].blocked_by =
+                                    ThreadBlock::WaitingForDebugger(None);
+                            }
+                        }
+                    }
+                }
                 let curr_thread_block = self.threads[self.current_thread].blocked_by.clone();
                 if matches!(
                     self.threads[self.current_thread].state,
@@ -1446,7 +1615,9 @@ impl Environment {
                     };
                     let mut gdb_server = self.gdb_server.take().unwrap();
                     gdb_server.wait_for_debugger(reason.clone(), &mut self);
-                    self.gdb_server = Some(gdb_server);
+                    if !gdb_server.is_detached() {
+                        self.gdb_server = Some(gdb_server);
+                    }
                 }
 
                 let next_thread = self.schedule_next_thread();

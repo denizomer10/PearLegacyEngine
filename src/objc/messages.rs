@@ -201,6 +201,52 @@ pub(crate) fn log_recent_messages(env: &mut Environment) {
     });
 }
 
+/// Logs message sends for the selectors listed in `PEAR_TRACE_SELECTORS`
+/// (comma-separated), together with the receiver's class and the first integer
+/// arguments. Intended for diagnosing guest control flow (scene transitions,
+/// animation start/stop) without a debugger.
+fn trace_selector(env: &mut Environment, class: Class, selector: SEL) {
+    static SELECTORS: std::sync::LazyLock<Vec<String>> = std::sync::LazyLock::new(|| {
+        std::env::var("PEAR_TRACE_SELECTORS")
+            .map(|v| {
+                v.split(',')
+                    .map(|s| s.trim().to_owned())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default()
+    });
+    if SELECTORS.is_empty() {
+        return;
+    }
+    let name = selector.as_str(&env.mem);
+    if !SELECTORS.iter().any(|s| s == name) {
+        return;
+    }
+    let regs = *env.cpu.regs();
+    let class_name: String = env
+        .objc
+        .get_host_object(class)
+        .and_then(|host_object| {
+            host_object
+                .as_any()
+                .downcast_ref::<super::ClassHostObject>()
+                .map(|class| class.name.clone())
+        })
+        .unwrap_or_default();
+    static START: std::sync::LazyLock<std::time::Instant> =
+        std::sync::LazyLock::new(std::time::Instant::now);
+    log!(
+        "PEAR_MSG: +{}ms [{} {}] args ({:#x}, {:#x}, {:#x})",
+        START.elapsed().as_millis(),
+        class_name,
+        name,
+        regs[2],
+        regs[3],
+        regs[4]
+    );
+}
+
 #[allow(non_snake_case)]
 fn objc_msgSend_inner(
     env: &mut Environment,
@@ -245,6 +291,7 @@ fn objc_msgSend_inner(
         }
         ring.push_back((orig_class, selector));
     });
+    trace_selector(env, orig_class, selector);
     if !skip_initialize {
         maybe_initialize_class(env, receiver);
     }

@@ -375,6 +375,25 @@ pub fn draw_in_rect(
     line_break_mode: UILineBreakMode,
     alignment: UITextAlignment,
 ) -> CGSize {
+    // `PEAR_TRACE_TEXT=1` logs every string drawn through the UIKit text APIs,
+    // with its target rect. This makes the guest's own UI labels observable
+    // (useful for driving menus from PEAR_TOUCH_SCRIPT without seeing the UI).
+    static TRACE_TEXT: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os("PEAR_TRACE_TEXT").is_some()
+    });
+    if *TRACE_TEXT {
+        let (x, y) = (rect.origin.x, rect.origin.y);
+        let (w, h) = (rect.size.width, rect.size.height);
+        log!(
+            "PEAR_TEXT: \"{}\" at ({:.1}, {:.1}) size ({:.1}, {:.1})",
+            text,
+            x,
+            y,
+            w,
+            h
+        );
+    }
+
     let context = UIGraphicsGetCurrentContext(env);
 
     let text_size = size_with_font(env, font, text, Some((rect.size, line_break_mode)));
