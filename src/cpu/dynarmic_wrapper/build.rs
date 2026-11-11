@@ -62,6 +62,11 @@ fn main() {
     if os_is_macos {
         build.define("CMAKE_OSX_ARCHITECTURES", "arm64");
         build.define("CMAKE_OSX_DEPLOYMENT_TARGET", "26.0");
+        // Tune the JIT for Apple's cores. apple-m1 is the baseline every
+        // Apple silicon Mac implements (M1 through current M- and A-series
+        // Macs), matching the Rust side's target-cpu in .cargo/config.toml.
+        build.cflag("-mcpu=apple-m1");
+        build.cxxflag("-mcpu=apple-m1");
     }
 
     // This is Windows- and Android-specific because on macOS or Linux, you can
