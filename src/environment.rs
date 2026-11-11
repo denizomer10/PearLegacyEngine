@@ -458,6 +458,7 @@ impl Environment {
             /* slide: */ 0,
         )
         .map_err(|e| format!("Could not load executable: {e}"))?;
+        crate::game_fixes::apply(&executable, &mut mem);
 
         let mut dylibs = Vec::new();
         for dylib in &executable.dynamic_libraries {

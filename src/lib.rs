@@ -38,6 +38,7 @@ mod environment;
 mod font;
 mod frameworks;
 mod fs;
+mod game_fixes;
 mod gdb;
 mod gles;
 mod image;
