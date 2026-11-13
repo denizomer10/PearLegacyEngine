@@ -14,4 +14,4 @@
 	branch = 07d0f51fa292895443f563f0cbde4cb3802d87fa
 [submodule "vendor/angle"]
 	path = vendor/angle
-	url = https://github.com/denizomer10/angle
+	url = https://github.com/denizomer10/PearANGLE.git

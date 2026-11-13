@@ -77,6 +77,36 @@ done
 for f in touchHLE_default_options.txt touchHLE_options.txt OPTIONS_HELP.txt; do
     [ -f "$f" ] && cp "$f" "$STAGE/"
 done
+# The binary statically links OpenAL Soft (LGPL) and is distributed under
+# GPL-3.0-or-later; the source files are MPL-2.0. Ship both texts and the
+# binary's own notices, as upstream touchHLE releases do.
+cp dev-scripts/gpl-3.0.txt "$STAGE/COPYING"
+cp LICENSE "$STAGE/LICENSE.MPL-2.0"
+{ "$BINARY" --copyright 2>&1 || true; } \
+    | awk 'found || /^The following authorship, copyright and license information/ {found=1; print}' \
+    > "$STAGE/NOTICES.txt"
+if ! grep -q "GNU General Public License" "$STAGE/NOTICES.txt"; then
+    echo "error: $BINARY --copyright did not print its license notice." >&2
+    exit 1
+fi
+# ANGLE (BSD-3-Clause) ships beside the engine, so its license must too. The
+# licenses of the libraries in that build (Dawn, abseil, libc++, zlib) are in
+# ANGLE's third_party/ directories; PearSilicon's scripts/stage-legacy-licenses.sh
+# collects them into THIRD_PARTY_LICENSES.txt.
+ANGLE_LICENSE=""
+for candidate in "$PEAR_ANGLE_SOURCE_DIR" "vendor/angle"; do
+    if [ -n "$candidate" ] && [ -f "$candidate/LICENSE" ]; then
+        ANGLE_LICENSE="$candidate/LICENSE"
+        break
+    fi
+done
+if [ -z "$ANGLE_LICENSE" ]; then
+    echo "error: ANGLE's LICENSE was not found; initialise vendor/angle or set PEAR_ANGLE_SOURCE_DIR." >&2
+    exit 1
+fi
+cp "$ANGLE_LICENSE" "$STAGE/touchHLE_dylibs/angle/LICENSE.ANGLE"
+printf 'Corresponding Source: https://github.com/denizomer10/PearLegacyEngine/tree/%s\n(with its submodules: git submodule update --init)\n' \
+    "$(git rev-parse HEAD)" > "$STAGE/SOURCE.txt"
 
 OUT="$REPO_ROOT/$NAME.tar.gz"
 rm -f "$OUT"

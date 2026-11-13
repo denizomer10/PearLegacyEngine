@@ -1,133 +1,131 @@
-<h1 align="center">PearLegacyEngine</h1>
+# PearLegacyEngine
 
-<p align="center">
-  <strong>Apple Silicon 32-bit iOS Compatibility Runtime for <a href="https://github.com/denizomer10/PearSilicon">PearSilicon</a></strong>
-</p>
+**The 32-bit iOS engine of [PearSilicon](https://github.com/denizomer10/PearSilicon) for Apple silicon Macs.**
 
-<p align="center">
-  <img src="https://img.shields.io/badge/platform-macOS%20arm64%20(Apple%20Silicon)-lightgrey?style=flat-square" alt="macOS arm64">
-  <img src="https://img.shields.io/badge/architecture-armv7%20%2F%20armv6%2032--bit%20iOS-blue?style=flat-square" alt="32-bit iOS">
-  <img src="https://img.shields.io/badge/host-PearSilicon-2ea44f?style=flat-square" alt="PearSilicon">
-  <img src="https://img.shields.io/badge/license-MPL--2.0%20%2F%20GPL--3.0-orange?style=flat-square" alt="License">
-</p>
+PearLegacyEngine runs iPhone and iPad apps built for 32-bit ARM (`armv6` and
+`armv7`, iOS 2 to iOS 10), which macOS cannot load at all. It is a high-level
+emulator: guest ARM code is recompiled to arm64, and the iOS frameworks the app
+calls (UIKit, Foundation, Core Animation, OpenGL ES, OpenAL, Audio Toolbox, …)
+are reimplemented on the host.
 
----
+PearLegacyEngine is a fork of [touchHLE](https://github.com/touchHLE/touchHLE)
+by hikari_no_yume and the touchHLE contributors. The emulator design and most of
+its code are theirs; this fork adapts it to Apple silicon, macOS 26 and
+PearSilicon. Upstream's history, authorship and changelog are preserved.
 
-**PearLegacyEngine** is the dedicated 32-bit iOS high-level compatibility runtime engine built for **[PearSilicon](https://github.com/denizomer10/PearSilicon)** on Apple Silicon Macs (`aarch64-apple-darwin`, macOS Sequoia / macOS 26 Tahoe and newer).
+## How it fits into PearSilicon
 
-Modern macOS and Apple Silicon hardware natively dropped 32-bit ARM (`armv7` / `armv6`) execution, meaning Apple’s Mac Catalyst and `/System/iOSSupport` stack can only run 64-bit (`arm64`) iOS binaries. **PearLegacyEngine** bridges this gap as a dependent runtime component of PearSilicon: while PearSilicon provides the native SwiftUI library manager, `.ipa` / `.app` installer, per-game settings UI, and macOS application host wrapper, PearLegacyEngine executes legacy 32-bit iOS games in the background with native-speed JIT translation (`dynarmic` ARM32 → Apple Silicon ARM64) and high-level framework implementations (UIKit, Foundation, CoreAnimation, OpenGL ES 1.1 & 2.0, AudioToolbox / OpenAL).
-
----
-
-## Relationship with PearSilicon
-
-PearLegacyEngine is designed as a **headless-controlled companion runtime** rather than a standalone desktop launcher:
-
-- **No Legacy SDL Picker UI:** The standalone SDL app picker GUI is disabled. All library management, IPA installation, free window resizing, fullscreen configuration, and save-data inspection are handled natively in SwiftUI by **[PearSilicon](https://github.com/denizomer10/PearSilicon)**.
-- **Zero Engine Branding in Game Windows:** When PearSilicon launches a 32-bit iOS title through PearLegacyEngine, it wraps the runtime inside a lightweight per-game macOS `.app` host bundle with the game’s own `CFBundleName`, `CFBundleDisplayName`, icon, and window title. Only the game’s own name appears in the macOS title bar, menu bar, and Dock.
-- **Unified Library & Sandbox Storage:** Game sandboxes (`Documents`, `Library`, `tmp`) and logs are routed directly into PearSilicon’s managed storage tree (`~/Library/Application Support/PearSilicon/Legacy32/`) via `PEAR_LEGACY_SANDBOX_ROOT` and `PEAR_LEGACY_RESOURCES_DIR`.
-
----
-
-## Key Features & Apple Silicon Optimizations
-
-- **ARM32 → ARM64 JIT on Apple Silicon:** Compiled with `-C target-cpu=apple-m1`, ThinLTO (`lto = "thin"`), single codegen unit, and `opt-level = 3` for low-latency 32-bit ARM translation on M-series chips.
-- **OpenGL ES 1.1 & OpenGL ES 2.0 on Metal via ANGLE:**
-  - The full graphics stack runs through a bundled **ANGLE** build (`libEGL.dylib` + `libGLESv2.dylib`, Metal backend): the engine creates EGL contexts and window surfaces over a `SDL_Metal` view, and GLES 1.1 / 2.0 commands execute on ANGLE's Metal renderer — no deprecated OpenGL framework usage anywhere. All contexts (guest and presentation) live in one EGL share group so renderbuffers and textures cross contexts freely.
-  - Guest `presentRenderbuffer` presentation is a unified internal-ES1 blit path (shared-renderbuffer FBO attach → `CopyTexImage2D` → fullscreen quad), independent of the guest's GL state.
-  - Zero-syscall hot render loop (`presentRenderbuffer` environment flags cached once via `LazyLock`, zero unguarded dyld debug logging overhead, and silent stdout/stderr capture when managed by PearSilicon).
-- **Expanded iOS Framework Coverage (Miku Flick & iOS 4/5 Games):**
-  - **Foundation:** `NSKeyedArchiver` / `NSKeyedUnarchiver` (`initForReadingWithData:`, `initForWritingWithMutableData:`, `encodeObject:forKey:`, `decodeObjectForKey:`, `finishEncoding`), lossy-safe `NSString` UTF-8/Shift-JIS fallback, `NSFileManager` directory creation, `NSHTTPCookieStorage`, `NSBundle`, `NSUserDefaults`, and `NSRunLoop`.
-  - **CoreFoundation & libSystem:** `CFAbsoluteTimeGetCurrent`, stack smash protection symbols (`___stack_chk_guard`, `___stack_chk_fail`), and Grand Central Dispatch / pthread shims.
-  - **AudioToolbox & OpenAL:** `AudioUnitGetProperty` / `AudioUnitSetProperty` across Global/Input/Output scopes, `AVAudioPlayer`, and hardware-accelerated OpenAL Soft output.
-  - **UIKit & CoreAnimation:** Multi-touch input forwarding, `CAEAGLLayer` fullscreen fast-path presentation, Retina high-DPI window scaling, and `UIAccelerometer` simulation.
-- **Free Window Resizing:** The game window can be resized freely at any time. The internal render resolution and touch coordinates stay locked to the game's own coordinate space — stretching is presentation-only, so gameplay and input never break. The legacy `1x`–`4x` scale-hack factors are gone (`--scale-hack=` is accepted but ignored for compatibility).
-- **Keyboard & Gamepad Keymapper:** Native desktop key bindings for touch-only games, read from the same JSON keymaps PearSilicon edits (`pear-keymap/v1`). Supports `tap`, `hold`, `swipe` and an analog `joystick` with dead-zone. Works for 32-bit titles too, since it is implemented inside the engine rather than injected as a dylib.
-- **Performance HUD:** `PEAR_FPS_HUD=1` draws an in-engine, zero-allocation 7-segment frame-rate overlay over the game viewport (the honest equivalent of Metal HUD for an OpenGL ES renderer), while `--print-fps` keeps logging the same numbers.
-- **Headless-first:** No engine picker window, no engine name in the window title or menu bar. The process only ever shows the currently running game.
-
----
-
-## Architecture Overview
+PearSilicon handles everything the user sees: the library, IPA and `.app`
+installation, per-game settings and save data. When a 32-bit game is launched,
+it starts this engine as a separate process inside a small per-game `.app` host,
+so the game's own name and icon appear in the title bar, menu bar and Dock.
 
 ```mermaid
 flowchart LR
-    subgraph PearSilicon ["PearSilicon (SwiftUI macOS App)"]
-        UI["SwiftUI Library & Detail View"]
-        Installer["PackageInstaller (.ipa / .app)"]
-        Launcher["AppLauncher (macOS .app Host Wrapper)"]
+    subgraph PS ["PearSilicon (SwiftUI app)"]
+        Library --> Launcher
     end
-
-    subgraph PearLegacyEngine ["PearLegacyEngine (Rust / C++ ARM64 Runtime)"]
-        CLI["Headless CLI Entrypoint"]
-        JIT["dynarmic JIT (armv7 -> arm64)"]
-        HLE["iOS HLE Frameworks (UIKit, Foundation, Audio)"]
-        GLES["ANGLE: OpenGL ES 1.1 / 2.0 -> Metal"]
+    subgraph PLE ["PearLegacyEngine (separate process)"]
+        JIT["PearLegacyJIT: ARMv7/Thumb-2 → arm64"]
+        HLE["iOS frameworks: UIKit, Foundation, audio, …"]
+        GLES["ANGLE: OpenGL ES 1.1/2.0 → Metal"]
     end
-
-    UI --> Installer
-    UI --> Launcher
-    Launcher -->|Spawns with Game Name & Icon| CLI
-    CLI --> JIT
-    CLI --> HLE
-    HLE --> GLES
+    Launcher -- "game .app + environment" --> JIT
+    JIT --> HLE --> GLES
 ```
 
----
+## Features
 
-## Building from Source (macOS Apple Silicon)
+- **Apple silicon CPU path.** Guest code runs on
+  [PearLegacyJIT](https://github.com/denizomer10/PearLegacyJIT), a Dynarmic
+  fork tuned for ARMv7/Thumb-2 guests; the engine is built for `apple-m1` with
+  ThinLTO.
+- **OpenGL ES 1.1 and 2.0 on Metal.** Rendering goes through a bundled ANGLE
+  build (`libEGL`, `libGLESv2`) on an `SDL_Metal` view. Guest and presentation
+  contexts share one EGL share group; the deprecated macOS OpenGL framework is
+  not used.
+- **Free window resizing.** The window can be resized or made fullscreen at any
+  time. The game's render resolution and touch coordinates stay in its own
+  coordinate space; scaling happens only at presentation. HiDPI windows and
+  Game Mode frame pacing are supported.
+- **Keyboard keymaps.** Reads the `pear-keymap/v1` files PearSilicon edits and
+  synthesizes real touches (`tap`, `hold`, `swipe`, dead-zoned `joystick`), so
+  touch-only games are playable from the keyboard.
+- **Performance HUD.** `PEAR_FPS_HUD=1` draws a frame-rate overlay inside the
+  game viewport.
+- **Headless by design.** No picker window and no engine branding: the process
+  only ever shows the running game.
 
-### Prerequisites
+## Requirements
 
-- Apple Silicon Mac (`arm64`) running **macOS 26 (Tahoe) or newer**. The engine is arm64-only and contains no x86_64 or Android code.
-- Xcode Command Line Tools (`xcode-select --install`) including the Metal Toolchain.
-- Rust toolchain (`rustup`, stable `aarch64-apple-darwin`).
-- CMake (`brew install cmake`) for building bundled native dependencies (`dynarmic`, `SDL2`, `openal-soft`).
-- GN + Ninja (`brew install gn ninja`) for building the bundled ANGLE graphics stack.
+- Apple silicon Mac with macOS 26 or later (the engine is arm64-only)
+- Xcode Command Line Tools with the Metal toolchain
+- Rust (stable, `aarch64-apple-darwin`), CMake, GN and Ninja
 
-### Compile Release Binary
+## Building
 
 ```sh
 git clone --recursive https://github.com/denizomer10/PearLegacyEngine.git
 cd PearLegacyEngine
 
-# Build the bundled ANGLE (Metal) graphics stack first:
+# ANGLE (Metal) first
 (cd vendor/angle && gn gen out/MacMetal --args='is_component_build=true' && ninja -C out/MacMetal libEGL libGLESv2)
 
-MACOSX_DEPLOYMENT_TARGET=26.0 cargo build --release
+# the engine, with PearLegacyJIT as the CPU backend
+PEAR_DYNARMIC_ROOT=../PearLegacyJIT MACOSX_DEPLOYMENT_TARGET=26.0 cargo build --release
 ```
 
-The optimized binary is emitted at `target/release/touchHLE` alongside the runtime asset directories:
-
-- `touchHLE_dylibs/` — guest ARM32 dynamic libraries (`libgcc`, `libstdc++`, `libobjc`).
-- `touchHLE_dylibs/angle/` — the ANGLE Metal runtime (`libEGL.dylib`, `libGLESv2.dylib` and their support dylibs, from `vendor/angle/out/MacMetal/`).
-- `touchHLE_fonts/` — fallback system fonts (Liberation & Noto CJK).
-- `touchHLE_default_options.txt` — per-title default compatibility flags.
-
-### SDL2 macOS Patch
-
-The bundled SDL2 (via `sdl2/bundled`) carries a local macOS fix in
-`patches/SDL-cocoaopengl-multiple-contexts.patch` (retained from the legacy
-OpenGL path; harmless with ANGLE). Apply it when building from a fresh
-checkout:
+Without `PEAR_DYNARMIC_ROOT` the engine builds the `vendor/dynarmic` submodule.
+The bundled SDL2 carries a local macOS fix; apply it once on a fresh checkout:
 
 ```sh
 git -C "$(dirname "$(find ~/.cargo/git/checkouts/rust-sdl2-* -name SDL -maxdepth 3 | head -1)")" \
   apply "$PWD/patches/SDL-cocoaopengl-multiple-contexts.patch"
 ```
 
-### Bundling into PearSilicon
+The binary is `target/release/touchHLE`. It needs these resources next to it:
 
-When building **[PearSilicon](https://github.com/denizomer10/PearSilicon)** via `./scripts/build-app.sh release`, PearSilicon automatically detects `/Users/mac/PearLegacyEngine` (or `PEARSILICON_LEGACY_ENGINE_SRC`), bundles the release binary and runtime resources into `PearSilicon.app/Contents/Resources/PearLegacyEngine/`, and signs the application bundle.
+| Path | Content |
+| --- | --- |
+| `touchHLE_dylibs/` | guest libraries (`libgcc`, `libstdc++`, zlib, SQLite, libxml2) with their licenses |
+| `touchHLE_dylibs/angle/` | the ANGLE Metal runtime from `vendor/angle/out/MacMetal` |
+| `touchHLE_fonts/` | Liberation and Noto Sans CJK fonts |
+| `touchHLE_default_options.txt` | per-title default options |
 
----
+`dev-scripts/make-pear-release.sh` assembles that layout, together with the
+license files, into `PearLegacyEngine-<version>-macos-arm64.tar.gz`.
+PearSilicon's `scripts/setup-legacy-engine.sh` builds and stages it for the app
+bundle. More build details are in [dev-docs/building.md](dev-docs/building.md).
 
-## Controls & Keymaps
+## Running directly
 
-PearSilicon writes keymaps to
-`~/Library/Application Support/PearSilicon/Keymaps/<bundle-id>.json` and passes
-the file through `PEAR_KEYMAP`. Each binding maps a keyboard key to a gesture on
-the emulated touch screen:
+PearSilicon starts the engine for you. For testing and diagnostics it can be run
+on its own with a `.app` bundle or an `.ipa`:
+
+```sh
+./target/release/touchHLE /path/to/Game.app
+./target/release/touchHLE --help        # all options
+./target/release/touchHLE --copyright   # licenses of everything in the binary
+```
+
+| Variable | Purpose |
+| --- | --- |
+| `PEAR_LEGACY_SANDBOX_ROOT` | where each game's `Documents`, `Library` and `tmp` are kept |
+| `PEAR_LEGACY_RESOURCES_DIR` | directory holding `touchHLE_dylibs/`, `touchHLE_fonts/` and the option files |
+| `PEAR_ANGLE_LIB_DIR` | ANGLE dylib directory (default `touchHLE_dylibs/angle/`) |
+| `PEAR_KEYMAP` | `pear-keymap/v1` JSON file with keyboard bindings |
+| `PEAR_FPS_HUD` | `1` draws the frame-rate overlay |
+| `PEAR_LEGACY_LOG_FILE` | log file when run outside PearSilicon |
+| `PEAR_TOUCH_SCRIPT` | scripted touches (`frame:x:y[:duration],…`) for repeatable tests |
+| `PEAR_DUMP_FRAME` | path prefix for raw frame dumps |
+| `PEAR_DEBUG_TOUCH`, `PEAR_DEBUG_MODULES` | verbose touch and per-module logging |
+| `PEAR_KEYMAP_SELFTEST`, `PEAR_HUD_SELFTEST` | headless self-tests of the keymapper and HUD |
+
+### Keymap format
+
+Coordinates are normalized to `0..1` against the game viewport, origin at the
+top left. Bindings with `"source": "controller"` are handled by PearSilicon's
+GameController bridge and ignored here.
 
 ```json
 {
@@ -142,49 +140,39 @@ the emulated touch screen:
 }
 ```
 
-- Coordinates are normalised `0..1` against the game viewport, top-left origin.
-- `hold` keeps one stable finger down for as long as the key is held; `swipe`
-  interpolates moves over `duration_ms`; `joystick` drags from `center` towards
-  the pressed direction with a `0.15` dead zone, so `wasd`/arrows work.
-- Bindings with `"source": "controller"` are ignored here — those are handled
-  by PearSilicon's GameController bridge.
+## Compatibility
 
----
+Compatibility is per game and narrower than PearSilicon's 64-bit path: a release
+can run one game well and crash in another. [CHANGELOG.md](CHANGELOG.md) lists
+what changed and which games were tested. Use the engine only with apps you are
+entitled to run; it includes no Apple software and no apps.
 
-## Direct CLI Usage (Advanced / Debugging)
+## The Pear stack
 
-PearLegacyEngine is invoked automatically by PearSilicon when you click **Launch** on any 32-bit iOS app in your library. For automated testing or diagnostics, you can also invoke the engine binary directly with a path to a `.app` bundle or `.ipa` archive:
-
-```sh
-./target/release/touchHLE /path/to/Game.app --large-window
-```
-
-The window is freely resizable while the game keeps its internal resolution and touch mapping; `--scale-hack=N` is deprecated and ignored.
-
-### Environment Variables Used by PearSilicon
-
-| Variable | Description |
+| Project | Role |
 | --- | --- |
-| `PEAR_LEGACY_SANDBOX_ROOT` | Directory where `Saves/<bundle-id>/` save data (`Documents`, `Library`, `tmp`) is stored. |
-| `PEAR_LEGACY_RESOURCES_DIR` | Directory containing `touchHLE_dylibs/`, `touchHLE_fonts/`, and `touchHLE_default_options.txt`. |
-| `PEAR_ANGLE_LIB_DIR` | Optional override for the ANGLE dylib directory (defaults to `touchHLE_dylibs/angle/`, then `vendor/angle/out/MacMetal/`). |
-| `PEAR_LEGACY_LOG_FILE` | Optional file path for standalone log output (omitted by default when PearSilicon captures process logs). |
-| `PEAR_TOUCH_SCRIPT` | Optional automated touch sequence (`frame:x:y[:duration],...`) for headless E2E verification. |
-| `PEAR_KEYMAP` | Path to a `pear-keymap/v1` JSON file enabling keyboard bindings. |
-| `PEAR_FPS_HUD` | `1` draws the in-engine frame-rate overlay over the game. |
-| `PEAR_DUMP_FRAME` | Optional path prefix to dump raw RGB framebuffer captures during diagnostics. |
-| `PEAR_DEBUG_TOUCH` | Logs every synthesised keymapper touch with its device coordinates. |
-| `PEAR_DEBUG_MODULES` | Comma-separated modules to enable verbose `log_dbg!` output for, e.g. `PearLegacyEngine::frameworks::uikit`. |
-| `PEAR_KEYMAP_SELFTEST` | Replays one bound tap and one joystick sweep after boot, for headless keymapper verification. |
-| `PEAR_HUD_SELFTEST` | One-shot readback that counts overlay pixels, proving the HUD really rendered. |
+| [PearSilicon](https://github.com/denizomer10/PearSilicon) | macOS app: library, installer, launcher |
+| [PearRuntime](https://github.com/denizomer10/PearRuntime) | compatibility layer for arm64 iOS apps |
+| [PearANGLE](https://github.com/denizomer10/PearANGLE) | OpenGL ES on Metal (ANGLE fork) |
+| **PearLegacyEngine** | 32-bit iOS engine (touchHLE fork) |
+| [PearLegacyJIT](https://github.com/denizomer10/PearLegacyJIT) | ARMv7 recompiler (Dynarmic fork) |
+| [PearDebug](https://github.com/denizomer10/PearDebug) | logging and diagnostics |
 
----
+## License and credits
 
-## Credits & License
+- **Source code:** Mozilla Public License 2.0 — see [LICENSE](LICENSE). Files
+  keep their original MPL headers.
+- **Binaries:** the `touchHLE` executable statically links OpenAL Soft
+  (LGPL-2.0-or-later), SDL2, Dynarmic/PearLegacyJIT and other libraries, and is
+  distributed under the **GNU General Public License v3.0 or later**
+  ([dev-scripts/gpl-3.0.txt](dev-scripts/gpl-3.0.txt), shipped as `COPYING`),
+  as upstream touchHLE releases are. `touchHLE --copyright` lists every
+  component and its license.
+- `touchHLE_dylibs/` and `touchHLE_fonts/` keep their own licenses; see the
+  `README.md`, `COPYING.*` and `LICENSE.*` files there.
 
-PearLegacyEngine is built upon the open-source foundations of [touchHLE](https://github.com/touchHLE/touchHLE) and [HyperHLE-Reborn](https://github.com/HyperHLE/HyperHLE-Reborn), adapted and optimized as the 32-bit iOS compatibility layer for **[PearSilicon](https://github.com/denizomer10/PearSilicon)**.
-
-- **Source Code License:** Mozilla Public License 2.0 (MPL-2.0).
-- **Binary Distribution License:** GNU General Public License v3.0 or later (GPL-3.0-or-later).
-- Bundled dynamic libraries (`touchHLE_dylibs/`) and fonts (`touchHLE_fonts/`) are covered by their respective licenses.
-
+Credits: [touchHLE](https://github.com/touchHLE/touchHLE) and its contributors,
+on whose work this engine is built; [HyperHLE-Reborn](https://github.com/HyperHLE/HyperHLE-Reborn);
+[Dynarmic](https://github.com/merryhime/dynarmic) by merryhime; and the authors
+of SDL, OpenAL Soft, ANGLE, stb and the other libraries listed by
+`touchHLE --copyright`.
