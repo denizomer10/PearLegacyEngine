@@ -244,7 +244,7 @@ pub const CLASSES: ClassExports = objc_classes! {
         let CGSize { width, height } = bounds.size;
         assert!((0.0..(u32::MAX as f32)).contains(&width));
         assert!((0.0..(u32::MAX as f32)).contains(&height));
-        let scale = crate::window::FRAMEBUFFER_SCALE;
+        let scale = crate::window::framebuffer_scale();
         (width.round() as u32 * scale, height.round() as u32 * scale)
     };
 

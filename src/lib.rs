@@ -41,6 +41,7 @@ mod fs;
 mod game_fixes;
 mod gdb;
 mod gles;
+mod host_perf;
 mod image;
 mod keymap;
 mod libc;
@@ -118,8 +119,11 @@ Special options:
 ";
 
 pub fn main<T: Iterator<Item = String>>(mut args: T) -> Result<(), String> {
+    host_perf::redirect_output_if_requested();
     echo!("PearLegacyEngine {} (Apple Silicon 32-bit iOS Runtime)", VERSION);
     echo!();
+
+    host_perf::configure_current_thread();
 
     {
         let base_path = paths::user_data_base_path();

@@ -12,6 +12,7 @@
 //! window system interaction in general, because it is assumed only one window
 //! will be needed for the runtime of the app.
 
+use std::sync::atomic::{AtomicU32, Ordering};
 use crate::gles::present::present_frame;
 use crate::gles::{create_gles1_ctx_no_parent_stack, GLESContext, GLES};
 use crate::image::Image;
@@ -85,11 +86,58 @@ impl DeviceOrientation {
 }
 /// Pixel density of host-side render targets (renderbuffers and composition
 /// framebuffers) relative to the guest app's point-based coordinate space.
-/// This is a fixed, guest-invisible rendering quality setting: the guest
-/// always sees the original device resolution (e.g. 320x480 points), while
-/// host-side rendering happens at this multiple for sharp output in large
-/// windows. Input coordinates are unaffected.
-pub const FRAMEBUFFER_SCALE: u32 = 2;
+/// This is a guest-invisible rendering quality setting: the guest always sees
+/// the original device resolution (e.g. 320x480 points), while host-side
+/// rendering happens at this multiple. Input coordinates are unaffected.
+///
+/// It is chosen once, when the window is created and before the guest can
+/// allocate a renderbuffer (see [choose_framebuffer_scale]): high enough that
+/// the game fills the largest window this display can show (full screen) with
+/// real pixels instead of an upscaled image. Earlier builds used a fixed 2x,
+/// which on a Retina display left a full-screen game at well under half of the
+/// display's resolution.
+static FRAMEBUFFER_SCALE: AtomicU32 = AtomicU32::new(2);
+
+/// See [FRAMEBUFFER_SCALE].
+pub fn framebuffer_scale() -> u32 {
+    FRAMEBUFFER_SCALE.load(Ordering::Relaxed)
+}
+
+/// Upper bound on the render target size, in pixels, so an iPad title on a
+/// large display does not allocate huge buffers.
+const MAX_RENDER_PIXELS: u64 = 3840 * 2400;
+
+/// Pick [FRAMEBUFFER_SCALE] for a device of `device_size` (portrait points) on
+/// a display of `display_pixels` (real pixels, either orientation).
+///
+/// `PEAR_LEGACY_RENDER_SCALE=<1..8>` forces a factor. `PEAR_RENDER_SCALE`
+/// (0.25..1, shared with the 64-bit runtime) scales the automatic choice down
+/// for performance.
+fn choose_framebuffer_scale(device_size: (u32, u32), display_pixels: (u32, u32)) -> u32 {
+    if let Some(forced) = std::env::var("PEAR_LEGACY_RENDER_SCALE")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .filter(|v| (1..=8).contains(v))
+    {
+        return forced;
+    }
+    let (dw, dh) = (device_size.0.max(1) as f32, device_size.1.max(1) as f32);
+    let (sw, sh) = (display_pixels.0.max(1) as f32, display_pixels.1.max(1) as f32);
+    // The game may rotate, so take the better fit of both orientations.
+    let fit = (sw / dw).min(sh / dh).max((sw / dh).min(sh / dw));
+    let mut scale = (fit.ceil() as u32).clamp(2, 6);
+    if let Some(factor) = std::env::var("PEAR_RENDER_SCALE")
+        .ok()
+        .and_then(|v| v.trim().parse::<f32>().ok())
+        .filter(|v| (0.25..=1.0).contains(v))
+    {
+        scale = ((scale as f32 * factor).round() as u32).max(1);
+    }
+    while scale > 2 && (dw as u64 * scale as u64) * (dh as u64 * scale as u64) > MAX_RENDER_PIXELS {
+        scale -= 1;
+    }
+    scale
+}
 
 fn size_for_orientation(family: DeviceFamily, orientation: DeviceOrientation) -> (u32, u32) {
     let (width, height) = family.portrait_size();
@@ -520,6 +568,7 @@ impl Window {
             let (width, height) = rotate_fullscreen_size(device_orientation, screen_size);
             let window = video_ctx
                 .window(title, width, height)
+                .allow_highdpi()
                 .fullscreen()
                 .build()
                 .unwrap();
@@ -528,6 +577,7 @@ impl Window {
             let (width, height) = video_ctx.display_bounds(0).unwrap().size();
             let window = video_ctx
                 .window(title, width, height)
+                .allow_highdpi()
                 .fullscreen_desktop()
                 .build()
                 .unwrap();
@@ -541,6 +591,7 @@ impl Window {
             };
             let window = video_ctx
                 .window(title, width, height)
+                .allow_highdpi()
                 .position_centered()
                 .resizable()
                 .build()
@@ -548,6 +599,35 @@ impl Window {
             log!("Created window with content size {}x{}.", width, height);
             window
         };
+
+        // HiDPI: the window is created with `allow_highdpi`, so its drawable is
+        // in real pixels (2x on Retina) rather than points. Size the guest's
+        // render targets for the largest form of the window, full screen on
+        // this display, so the image is never upscaled.
+        {
+            let (points_w, _) = window.size();
+            let (pixels_w, _) = window.drawable_size();
+            let density = if points_w > 0 { pixels_w as f32 / points_w as f32 } else { 1.0 };
+            let display = video_ctx
+                .display_bounds(window.display_index().unwrap_or(0))
+                .map(|rect| rect.size())
+                .unwrap_or((points_w, window.size().1));
+            let display_pixels = (
+                (display.0 as f32 * density).round() as u32,
+                (display.1 as f32 * density).round() as u32,
+            );
+            let scale = choose_framebuffer_scale(device_family.portrait_size(), display_pixels);
+            FRAMEBUFFER_SCALE.store(scale, Ordering::Relaxed);
+            log!(
+                "Render scale {}x (window {}x{} points, {:.1}x HiDPI, display {}x{} pixels).",
+                scale,
+                window.size().0,
+                window.size().1,
+                density,
+                display_pixels.0,
+                display_pixels.1
+            );
+        }
 
         // Set up ANGLE (Metal): host the game's rendering in a CAMetalLayer and
         // create the EGL window surface for it. All GL contexts (guest and
@@ -1907,9 +1987,17 @@ impl Window {
     }
 
     /// Special offset to add to y co-ordinates, only when drawing to screen.
+    /// Tracked in window points; returned in drawable pixels (HiDPI).
     pub fn viewport_y_offset(&self) -> u32 {
         #[cfg(target_os = "macos")]
-        return self.viewport_y_offset;
+        {
+            if self.viewport_y_offset == 0 {
+                return 0;
+            }
+            let points = self.window.size().1.max(1);
+            let pixels = self.window.drawable_size().1;
+            return (self.viewport_y_offset as u64 * pixels as u64 / points as u64) as u32;
+        }
         #[cfg(not(target_os = "macos"))]
         return 0;
     }

@@ -129,7 +129,7 @@ impl Options {
             self.large_window = true;
         } else if let Some(value) = arg.strip_prefix("--scale-hack=") {
             // Deprecated: the render scale is now fixed (see
-            // [crate::window::FRAMEBUFFER_SCALE]) and the window is freely
+            // [crate::window::framebuffer_scale]) and the window is freely
             // resizable, so this is accepted for compatibility but ignored.
             let _: u32 = value
                 .parse()

@@ -134,7 +134,7 @@ pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<In
         let screen: id = msg_class![env; UIScreen mainScreen];
         msg![env; screen bounds]
     };
-    let scale: u32 = crate::window::FRAMEBUFFER_SCALE;
+    let scale: u32 = crate::window::framebuffer_scale();
     let fb_width = screen_bounds.size.width as u32 * scale;
     let fb_height = screen_bounds.size.height as u32 * scale;
     let present_frame_args = (

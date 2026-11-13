@@ -1337,7 +1337,7 @@ impl Environment {
                 ThreadBlock::NotBlocked => {}
                 ThreadBlock::Sleeping(until) => {
                     let duration = until.duration_since(Instant::now());
-                    std::thread::sleep(duration);
+                    crate::host_perf::sleep(duration);
                 }
                 _ => {
                     panic!("Unexpected ThreadBlock in app picker!");
@@ -2054,7 +2054,7 @@ impl Environment {
             if let Some(next_awakening) = next_awakening {
                 let duration = next_awakening.duration_since(Instant::now());
                 log_dbg!("All threads blocked/asleep, sleeping for {:?}.", duration);
-                std::thread::sleep(duration);
+                crate::host_perf::sleep(duration);
                 // Try again, there should be some thread awake now (or
                 // there will be soon, since timing is approximate).
                 continue;

@@ -378,7 +378,7 @@ fn glShadeModel(env: &mut Environment, mode: GLenum) {
 fn glScissor(env: &mut Environment, x: GLint, y: GLint, width: GLsizei, height: GLsizei) {
     // apply the framebuffer scale: assume framebuffer's size is larger than the
     // app thinks and scale scissor appropriately
-    let factor = crate::window::FRAMEBUFFER_SCALE as GLsizei;
+    let factor = crate::window::framebuffer_scale() as GLsizei;
     let (x, y) = (x * factor, y * factor);
     let (width, height) = (width * factor, height * factor);
     with_ctx_and_mem(env, |gles, _mem| unsafe {
@@ -388,7 +388,7 @@ fn glScissor(env: &mut Environment, x: GLint, y: GLint, width: GLsizei, height: 
 fn glViewport(env: &mut Environment, x: GLint, y: GLint, width: GLsizei, height: GLsizei) {
     // apply the framebuffer scale: assume framebuffer's size is larger than the
     // app thinks and scale viewport appropriately
-    let factor = crate::window::FRAMEBUFFER_SCALE as GLsizei;
+    let factor = crate::window::framebuffer_scale() as GLsizei;
     let (x, y) = (x * factor, y * factor);
     let (width, height) = (width * factor, height * factor);
     with_ctx_and_mem(env, |gles, _mem| unsafe {
@@ -1268,7 +1268,7 @@ fn glRenderbufferStorageOES(
 ) {
     // apply the framebuffer scale: give the app a larger framebuffer than it
     // asked for
-    let factor = crate::window::FRAMEBUFFER_SCALE as GLsizei;
+    let factor = crate::window::framebuffer_scale() as GLsizei;
     let (width, height) = (width * factor, height * factor);
     with_ctx_and_mem(env, |gles, _mem| unsafe {
         gles.RenderbufferStorageOES(target, internalformat, width, height)
@@ -1315,7 +1315,7 @@ fn glGetRenderbufferParameterivOES(
     pname: GLenum,
     params: MutPtr<GLint>,
 ) {
-    let factor = crate::window::FRAMEBUFFER_SCALE as GLint;
+    let factor = crate::window::framebuffer_scale() as GLint;
     with_ctx_and_mem(env, |gles, mem| {
         let params = mem.ptr_at_mut(params, 1);
         unsafe { gles.GetRenderbufferParameterivOES(target, pname, params) };
